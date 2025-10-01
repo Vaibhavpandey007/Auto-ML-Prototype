@@ -8,6 +8,7 @@ import shap
 import optuna
 import matplotlib.pyplot as plt
 import seaborn as sns
+from matplotlib.backends.backend_pdf import PdfPages
 
 from typing import Tuple, Dict, Any
 from fastapi import FastAPI, UploadFile, File
@@ -24,6 +25,7 @@ from sklearn.linear_model import LogisticRegression, LinearRegression
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.svm import SVC, SVR
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, r2_score, mean_squared_error
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, roc_curve
 
 try:
     from xgboost import XGBClassifier, XGBRegressor
@@ -31,7 +33,7 @@ try:
 except Exception:
     XGBOOST_AVAILABLE = False
 
-# --------------------------- Streamlit Utility ---------------------------
+
 
 def load_data(uploaded_file) -> pd.DataFrame:
     try:
@@ -143,6 +145,85 @@ def explain_model(best_pipeline, X_sample, y_sample=None):
             importances.plot(kind='bar', ax=ax)
             ax.set_title("Feature Importance (Permutation)")
             st.pyplot(fig)
+            
+def generate_correlation_heatmap(df: pd.DataFrame):
+    numeric_df = df.select_dtypes(include=[np.number])
+    if numeric_df.shape[1] == 0:
+        return None
+    fig, ax = plt.subplots(figsize=(8, 6))
+    sns.heatmap(numeric_df.corr(), ax=ax, cmap='coolwarm', annot=False)
+    ax.set_title('Correlation Heatmap')
+    return fig
+
+def generate_target_distribution(y: pd.Series, task: str):
+    fig, ax = plt.subplots(figsize=(6, 4))
+    if task == 'classification':
+        pd.Series(y).value_counts().plot(kind='bar', ax=ax)
+        ax.set_xlabel('Class')
+        ax.set_ylabel('Count')
+        ax.set_title('Target Class Distribution')
+    else:
+        sns.histplot(y, bins=30, kde=True, ax=ax)
+        ax.set_title('Target Distribution')
+    return fig
+
+def generate_feature_importance_permutation(pipeline: Pipeline, X: pd.DataFrame, y: pd.Series):
+    try:
+        X_processed = pipeline['preprocessor'].transform(X)
+        feature_names = pipeline['preprocessor'].get_feature_names_out()
+        result = permutation_importance(pipeline['model'], X_processed, y,
+                                        n_repeats=5, random_state=42, n_jobs=-1)
+        importances = pd.Series(result.importances_mean, index=feature_names).sort_values(ascending=False)[:30]
+        fig, ax = plt.subplots(figsize=(8, 6))
+        importances.plot(kind='barh', ax=ax)
+        ax.invert_yaxis()
+        ax.set_title('Feature Importance (Permutation)')
+        return fig
+    except Exception:
+        return None
+
+def generate_pred_vs_actual(y_true, y_pred):
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.scatter(y_true, y_pred, alpha=0.6)
+    lims = [min(np.min(y_true), np.min(y_pred)), max(np.max(y_true), np.max(y_pred))]
+    ax.plot(lims, lims, 'r--')
+    ax.set_xlabel('Actual')
+    ax.set_ylabel('Predicted')
+    ax.set_title('Predicted vs Actual')
+    return fig
+
+def generate_residuals_plot(y_true, y_pred):
+    residuals = y_true - y_pred
+    fig, ax = plt.subplots(figsize=(6, 4))
+    sns.histplot(residuals, bins=30, kde=True, ax=ax)
+    ax.set_title('Residuals Distribution')
+    return fig
+
+def generate_confusion_matrix_plot(y_true, y_pred):
+    fig, ax = plt.subplots(figsize=(6, 5))
+    cm = confusion_matrix(y_true, y_pred)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+    disp.plot(ax=ax, cmap='Blues', colorbar=False)
+    ax.set_title('Confusion Matrix')
+    return fig
+
+def generate_roc_curve_plot(model, X_processed_test, y_true):
+    # Only for binary classification with predict_proba
+    try:
+        if len(np.unique(y_true)) != 2:
+            return None
+        proba = model.predict_proba(X_processed_test)[:, 1]
+        fpr, tpr, _ = roc_curve(y_true, proba)
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.plot(fpr, tpr, label='ROC curve')
+        ax.plot([0, 1], [0, 1], 'k--')
+        ax.set_xlabel('False Positive Rate')
+        ax.set_ylabel('True Positive Rate')
+        ax.set_title('ROC Curve (Test)')
+        ax.legend()
+        return fig
+    except Exception:
+        return None
 # --------------------------- Streamlit App ---------------------------
 
 st.set_page_config(page_title='SmartML Pipeline Builder', layout='wide')
@@ -179,13 +260,124 @@ if uploaded_file:
         ('preprocessor', preprocessor),
         ('model', best_model)
     ])
-    best_pipeline.fit(X, y)
+    # Train/Test split for evaluation and plots
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42, stratify=y if task=='classification' else None)
+    best_pipeline.fit(X_train, y_train)
 
     st.success("Best model fitted.")
-    sample_size = min(100, len(X))
-    X_sample = X.sample(sample_size, random_state=42)
-    y_sample = y.sample(sample_size, random_state=42)
+
+    # Metrics
+    y_pred = best_pipeline.predict(X_test)
+    metrics_dict = {}
+    if task == 'classification':
+        metrics_dict['accuracy'] = accuracy_score(y_test, y_pred)
+        metrics_dict['f1_macro'] = f1_score(y_test, y_pred, average='macro')
+        # ROC AUC if binary and proba available
+        roc_auc_val = None
+        try:
+            if len(np.unique(y_test)) == 2 and hasattr(best_pipeline['model'], 'predict_proba'):
+                proba = best_pipeline['model'].predict_proba(best_pipeline['preprocessor'].transform(X_test))[:, 1]
+                roc_auc_val = roc_auc_score(y_test, proba)
+        except Exception:
+            roc_auc_val = None
+        if roc_auc_val is not None:
+            metrics_dict['roc_auc'] = roc_auc_val
+    else:
+        metrics_dict['r2'] = r2_score(y_test, y_pred)
+        rmse = mean_squared_error(y_test, y_pred, squared=False)
+        metrics_dict['rmse'] = rmse
+
+    metrics_df = pd.DataFrame([metrics_dict])
+    st.subheader("Evaluation Metrics (Test)")
+    st.dataframe(metrics_df)
+
+    # Chart selection UI
+    st.subheader("Visualizations")
+    chart_options = [
+        'Correlation Heatmap',
+        'Target Distribution',
+        'Feature Importance (Permutation)',
+        'Predicted vs Actual' if task=='regression' else 'Confusion Matrix',
+        'Residuals' if task=='regression' else 'ROC Curve',
+    ]
+    selected_charts = st.multiselect('Select charts to display and include in report', chart_options, default=chart_options[:2])
+
+    figures = []
+    # Generate and show figures as per selection
+    if 'Correlation Heatmap' in selected_charts:
+        fig = generate_correlation_heatmap(df)
+        if fig is not None:
+            st.pyplot(fig)
+            figures.append(fig)
+        else:
+            st.info('Correlation Heatmap not available (no numeric columns).')
+
+    if 'Target Distribution' in selected_charts:
+        fig = generate_target_distribution(y, task)
+        st.pyplot(fig)
+        figures.append(fig)
+
+    if 'Feature Importance (Permutation)' in selected_charts:
+        fig = generate_feature_importance_permutation(best_pipeline, X_test, y_test)
+        if fig is not None:
+            st.pyplot(fig)
+            figures.append(fig)
+        else:
+            st.info('Feature importance could not be computed.')
+
+    if task == 'regression':
+        if 'Predicted vs Actual' in selected_charts:
+            fig = generate_pred_vs_actual(y_test, y_pred)
+            st.pyplot(fig)
+            figures.append(fig)
+        if 'Residuals' in selected_charts:
+            fig = generate_residuals_plot(y_test, y_pred)
+            st.pyplot(fig)
+            figures.append(fig)
+    else:
+        if 'Confusion Matrix' in selected_charts:
+            fig = generate_confusion_matrix_plot(y_test, y_pred)
+            st.pyplot(fig)
+            figures.append(fig)
+        if 'ROC Curve' in selected_charts:
+            X_test_processed = best_pipeline['preprocessor'].transform(X_test)
+            fig = generate_roc_curve_plot(best_pipeline['model'], X_test_processed, y_test)
+            if fig is not None:
+                st.pyplot(fig)
+                figures.append(fig)
+            else:
+                st.info('ROC curve not available (needs binary classification and predict_proba).')
+
+    # Optional: SHAP on a small sample
+    sample_size = min(100, len(X_train))
+    X_sample = X_train.sample(sample_size, random_state=42)
+    y_sample = pd.Series(y_train).sample(sample_size, random_state=42) if hasattr(y_train, '__len__') else None
     explain_model(best_pipeline, X_sample, y_sample)
+
+    # Downloads: metrics CSV and figures PDF
+    st.subheader("Download Reports")
+    csv_bytes = metrics_df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label='Download Metrics (CSV)',
+        data=csv_bytes,
+        file_name='metrics_report.csv',
+        mime='text/csv'
+    )
+
+    if len(figures) > 0:
+        pdf_buffer = io.BytesIO()
+        with PdfPages(pdf_buffer) as pdf:
+            for fig in figures:
+                pdf.savefig(fig, bbox_inches='tight')
+        pdf_buffer.seek(0)
+        st.download_button(
+            label='Download Selected Charts (PDF)',
+            data=pdf_buffer,
+            file_name='visualizations_report.pdf',
+            mime='application/pdf'
+        )
+    else:
+        st.info('Select at least one chart to enable PDF download.')
 
 # --------------------------- FastAPI Server ---------------------------
 
