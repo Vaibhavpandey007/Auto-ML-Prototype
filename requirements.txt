@@ -11,3 +11,4 @@ lightgbm
 catboost
 shap
 optuna
+fastapi
