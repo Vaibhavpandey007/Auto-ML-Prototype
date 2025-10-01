@@ -108,29 +108,31 @@ import matplotlib.pyplot as plt
 from sklearn.inspection import permutation_importance
 
 def explain_model(best_pipeline, X_sample, y_sample=None):
+    """
+    Displays feature importance in Streamlit.
+    Tries SHAP first; if it fails (including additivity errors), falls back to permutation importance.
+    """
     try:
-        # Preprocess the sample data
+        # Preprocess sample data
         X_processed = best_pipeline['preprocessor'].transform(X_sample)
         feature_names = best_pipeline['preprocessor'].get_feature_names_out()
         X_processed = pd.DataFrame(X_processed, columns=feature_names)
 
         st.subheader("Feature Importance (SHAP)")
-
-        # Create matplotlib figure
+        
         fig, ax = plt.subplots()
 
-        # Use general SHAP Explainer
+        # Use general SHAP Explainer (works for trees, linear, and others)
         explainer = shap.Explainer(best_pipeline['model'], X_processed)
         shap_values = explainer(X_processed)
 
         shap.summary_plot(shap_values, X_processed, show=False)
-        st.pyplot(fig)
+        # Render the active SHAP figure rather than the blank one we created
+        st.pyplot(plt.gcf())
 
-    except Exception as e:
-        st.warning(f"SHAP explainability failed: {e}")
-        st.info("Falling back to permutation feature importance...")
-
-        # Fallback: permutation importance
+    except Exception:
+        # Catch any SHAP errors silently and fallback
+        st.info("SHAP explainability failed or produced warnings. Falling back to permutation importance...")
         if y_sample is not None:
             result = permutation_importance(best_pipeline['model'], X_processed, y_sample,
                                             n_repeats=5, random_state=42, n_jobs=-1)
@@ -180,7 +182,10 @@ if uploaded_file:
     best_pipeline.fit(X, y)
 
     st.success("Best model fitted.")
-    explain_model(best_pipeline, X.sample(min(100, len(X))))
+    sample_size = min(100, len(X))
+    X_sample = X.sample(sample_size, random_state=42)
+    y_sample = y.sample(sample_size, random_state=42)
+    explain_model(best_pipeline, X_sample, y_sample)
 
 # --------------------------- FastAPI Server ---------------------------
 
